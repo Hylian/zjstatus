@@ -315,7 +315,7 @@ impl State {
                     if self.focus_cwd_commands.iter().any(|n| n == name)
                         && context.get("cwd").map(PathBuf::from) != self.state.focused_pane_cwd
                     {
-                        tracing::debug!("discarding stale command result for {name}");
+                        tracing::info!("discarding stale command result for {name} context.cwd={:?} focused={:?}", context.get("cwd").map(PathBuf::from), self.state.focused_pane_cwd);
                         return false;
                     }
 
@@ -330,6 +330,24 @@ impl State {
                     };
 
                     let key = name.to_owned();
+                    let mut should_accept = true;
+                    if let Some(previous) = self.state.command_results.get(&key) {
+                        if let (Some(prev_ts_str), Some(res_ts_str)) = (
+                            previous.context.get("spawn_timestamp_ms"),
+                            context.get("spawn_timestamp_ms"),
+                        ) {
+                            if let (Ok(prev_ts), Ok(res_ts)) = (
+                                prev_ts_str.parse::<i64>(),
+                                res_ts_str.parse::<i64>(),
+                            ) {
+                                if res_ts < prev_ts {
+                                    tracing::info!("discarding out-of-order command result for {name}");
+                                    should_accept = false;
+                                }
+                            }
+                        }
+                    }
+
                     let result = CommandResult {
                         exit_code,
                         stdout,
@@ -337,22 +355,15 @@ impl State {
                         context,
                     };
 
-                    // Repaint when the result changes something the format can
-                    // show. Without this the new value sits in state until an
-                    // unrelated event or the render timer comes around, which is
-                    // visible as latency in any command widget.
-                    //
-                    // `context` is excluded from the comparison on purpose: it
-                    // carries a per-invocation timestamp, and a focus-following
-                    // command is re-run on every render until its result lands,
-                    // so including it would repaint for identical output.
-                    should_render = self.state.command_results.get(&key).is_none_or(|previous| {
-                        previous.exit_code != result.exit_code
-                            || previous.stdout != result.stdout
-                            || previous.stderr != result.stderr
-                    });
+                    if should_accept {
+                        should_render = self.state.command_results.get(&key).is_none_or(|previous| {
+                            previous.exit_code != result.exit_code
+                                || previous.stdout != result.stdout
+                                || previous.stderr != result.stderr
+                        });
 
-                    self.state.command_results.insert(key, result);
+                        self.state.command_results.insert(key, result);
+                    }
                 }
             }
             Event::SessionUpdate(session_info, _) => {

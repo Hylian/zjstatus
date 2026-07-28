@@ -201,6 +201,10 @@ fn run_command_if_needed(command_config: CommandConfig, name: &str, state: &Zell
             "timestamp".to_owned(),
             ts.format(TIMESTAMP_FORMAT).to_string(),
         );
+        context.insert(
+            "spawn_timestamp_ms".to_owned(),
+            ts.timestamp_millis().to_string(),
+        );
 
         if let Some(cwd) = &cwd {
             context.insert("cwd".to_owned(), cwd.to_string_lossy().into_owned());
