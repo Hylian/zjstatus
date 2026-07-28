@@ -33,6 +33,7 @@ struct State {
     widget_map: BTreeMap<String, Arc<dyn Widget>>,
     focus_cwd_commands: Vec<String>,
     err: Option<anyhow::Error>,
+    pane_cwds: BTreeMap<PaneId, PathBuf>,
 }
 
 #[cfg(not(test))]
@@ -112,6 +113,8 @@ impl ZellijPlugin for State {
             focused_pane_id: None,
             focused_pane_cwd: None,
         };
+
+        self.pane_cwds = std::collections::BTreeMap::new();
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
@@ -202,10 +205,13 @@ impl State {
 
         let new_cwd = match new_id {
             Some(pane_id) => match get_pane_cwd(pane_id) {
-                Ok(cwd) => Some(cwd),
+                Ok(cwd) => {
+                    self.pane_cwds.insert(pane_id, cwd.clone());
+                    Some(cwd)
+                }
                 Err(e) => {
                     tracing::debug!("could not get pane cwd: {e}");
-                    None
+                    self.pane_cwds.get(&pane_id).cloned()
                 }
             },
             None => None,
@@ -287,6 +293,7 @@ impl State {
             Event::CwdChanged(pane_id, cwd, _clients) => {
                 tracing::Span::current().record("event_type", "Event::CwdChanged");
                 tracing::debug!(pane_id = ?pane_id, cwd = ?cwd);
+                self.pane_cwds.insert(pane_id, cwd.clone());
 
                 if Some(pane_id) == self.state.focused_pane_id
                     && self.set_focused_pane_cwd(Some(cwd))

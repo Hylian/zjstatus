@@ -203,7 +203,7 @@ fn run_command_if_needed(command_config: CommandConfig, name: &str, state: &Zell
         );
         context.insert(
             "spawn_timestamp_ms".to_owned(),
-            ts.timestamp_millis().to_string(),
+            ts.timestamp_micros().to_string(),
         );
 
         if let Some(cwd) = &cwd {
