@@ -77,11 +77,16 @@ impl Widget for CommandWidget {
 
         run_command_if_needed(command_config.clone(), name, state);
 
+        let fallback_result;
         let command_result = match state.command_results.get(name) {
             Some(cr) => cr,
-            None => {
-                return "".to_owned();
-            }
+            None => match read_cached_command_result(name) {
+                Some(cr) => {
+                    fallback_result = cr;
+                    &fallback_result
+                }
+                None => return "".to_owned(),
+            },
         };
 
         if command_config.hide_on_empty_stdout && command_result.stdout.is_empty() {
@@ -413,6 +418,22 @@ pub fn release_command_lock(state: &ZellijState, name: &str) {
     if Path::new(&path).exists() {
         let _ = remove_file(path);
     }
+}
+
+pub fn write_cached_command_result(name: &str, result: &CommandResult) {
+    let path = format!("/tmp/zjstatus-cmd-cache.{}", name);
+    let _ = std::fs::write(path, &result.stdout);
+}
+
+pub fn read_cached_command_result(name: &str) -> Option<CommandResult> {
+    let path = format!("/tmp/zjstatus-cmd-cache.{}", name);
+    let stdout = std::fs::read_to_string(path).ok()?;
+    Some(CommandResult {
+        exit_code: Some(0),
+        stdout,
+        stderr: String::new(),
+        context: BTreeMap::new(),
+    })
 }
 
 fn commandline_parser(input: &str) -> Vec<String> {

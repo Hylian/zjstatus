@@ -369,7 +369,8 @@ impl State {
                                 || previous.stderr != result.stderr
                         });
 
-                        self.state.command_results.insert(key, result);
+                        self.state.command_results.insert(key.clone(), result.clone());
+                        zjstatus::widgets::command::write_cached_command_result(&key, &result);
                     }
                 }
             }
