@@ -118,6 +118,9 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        if self.state.focused_pane_cwd.is_none() {
+            self.update_focused_pane();
+        }
         let mut should_render = false;
 
         match pipe_message.source {
@@ -197,7 +200,7 @@ impl State {
             .and_then(|panes| panes.iter().find(|p| p.is_focused && !p.is_plugin))
             .map(|p| PaneId::Terminal(p.id));
 
-        if new_id == self.state.focused_pane_id {
+        if new_id == self.state.focused_pane_id && self.state.focused_pane_cwd.is_some() {
             return;
         }
 
@@ -246,7 +249,7 @@ impl State {
         let mut should_render = false;
         match event {
             Event::Mouse(mouse_info) => {
-                tracing::Span::current().record("event_type", "Event::Mouse");
+                tracing::Span::current().record("event_type", "event::mouse");
                 tracing::debug!(mouse = ?mouse_info);
 
                 self.module_config.handle_mouse_action(
@@ -294,6 +297,10 @@ impl State {
                 tracing::Span::current().record("event_type", "Event::CwdChanged");
                 tracing::debug!(pane_id = ?pane_id, cwd = ?cwd);
                 self.pane_cwds.insert(pane_id, cwd.clone());
+
+                if self.state.focused_pane_id.is_none() {
+                    self.update_focused_pane();
+                }
 
                 if Some(pane_id) == self.state.focused_pane_id
                     && self.set_focused_pane_cwd(Some(cwd))
@@ -407,11 +414,16 @@ impl State {
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
                 self.state.tabs = tab_info;
 
+                self.update_focused_pane();
+
                 should_render = true;
             }
             Event::Timer(_) => {
                 tracing::Span::current().record("event_type", "Event::Timer");
                 set_timeout(REFRESH_INTERVAL_SECONDS);
+                if self.state.focused_pane_cwd.is_none() {
+                    self.update_focused_pane();
+                }
                 self.state.cache_mask = 0;
 
                 should_render = true;

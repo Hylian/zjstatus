@@ -55,6 +55,7 @@ pub struct CommandResult {
 pub struct CommandWidget {
     config: BTreeMap<String, CommandConfig>,
     zj_conf: BTreeMap<String, String>,
+    disk_cache: std::sync::Mutex<BTreeMap<String, Option<(String, String)>>>,
 }
 
 impl CommandWidget {
@@ -62,7 +63,34 @@ impl CommandWidget {
         Self {
             config: parse_config(config),
             zj_conf: config.clone(),
+            disk_cache: std::sync::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn get_cached_fallback(
+        &self,
+        name: &str,
+        follow_focus_cwd: bool,
+        focused_pane_cwd: Option<&Path>,
+    ) -> Option<CommandResult> {
+        let mut cache = self.disk_cache.lock().ok()?;
+        let entry = cache
+            .entry(name.to_owned())
+            .or_insert_with(|| read_cached_command_entry(name));
+        let (cached_cwd, stdout) = entry.as_ref()?;
+        if follow_focus_cwd {
+            if let Some(actual_cwd) = focused_pane_cwd {
+                if !cached_cwd.is_empty() && Path::new(cached_cwd) != actual_cwd {
+                    return None;
+                }
+            }
+        }
+        Some(CommandResult {
+            exit_code: Some(0),
+            stdout: stdout.clone(),
+            stderr: String::new(),
+            context: BTreeMap::new(),
+        })
     }
 }
 
@@ -80,7 +108,11 @@ impl Widget for CommandWidget {
         let fallback_result;
         let command_result = match state.command_results.get(name) {
             Some(cr) => cr,
-            None => match read_cached_command_result(name) {
+            None => match self.get_cached_fallback(
+                name,
+                command_config.follow_focus_cwd,
+                state.focused_pane_cwd.as_deref(),
+            ) {
                 Some(cr) => {
                     fallback_result = cr;
                     &fallback_result
@@ -422,18 +454,20 @@ pub fn release_command_lock(state: &ZellijState, name: &str) {
 
 pub fn write_cached_command_result(name: &str, result: &CommandResult) {
     let path = format!("/tmp/zjstatus-cmd-cache.{}", name);
-    let _ = std::fs::write(path, &result.stdout);
+    let cwd = result.context.get("cwd").map(|s| s.as_str()).unwrap_or("");
+    let payload = format!("cwd:{}\n{}", cwd, result.stdout);
+    let _ = std::fs::write(path, payload);
 }
 
-pub fn read_cached_command_result(name: &str) -> Option<CommandResult> {
+pub fn read_cached_command_entry(name: &str) -> Option<(String, String)> {
     let path = format!("/tmp/zjstatus-cmd-cache.{}", name);
-    let stdout = std::fs::read_to_string(path).ok()?;
-    Some(CommandResult {
-        exit_code: Some(0),
-        stdout,
-        stderr: String::new(),
-        context: BTreeMap::new(),
-    })
+    let raw = std::fs::read_to_string(path).ok()?;
+    if let Some(rest) = raw.strip_prefix("cwd:") {
+        if let Some((cwd, stdout)) = rest.split_once('\n') {
+            return Some((cwd.to_owned(), stdout.to_owned()));
+        }
+    }
+    Some((String::new(), raw))
 }
 
 fn commandline_parser(input: &str) -> Vec<String> {
