@@ -330,15 +330,30 @@ impl State {
                         Err(_) => "".to_owned(),
                     };
 
-                    self.state.command_results.insert(
-                        name.to_owned(),
-                        CommandResult {
-                            exit_code,
-                            stdout,
-                            stderr,
-                            context,
-                        },
-                    );
+                    let key = name.to_owned();
+                    let result = CommandResult {
+                        exit_code,
+                        stdout,
+                        stderr,
+                        context,
+                    };
+
+                    // Repaint when the result changes something the format can
+                    // show. Without this the new value sits in state until an
+                    // unrelated event or the render timer comes around, which is
+                    // visible as latency in any command widget.
+                    //
+                    // `context` is excluded from the comparison on purpose: it
+                    // carries a per-invocation timestamp, and a focus-following
+                    // command is re-run on every render until its result lands,
+                    // so including it would repaint for identical output.
+                    should_render = self.state.command_results.get(&key).is_none_or(|previous| {
+                        previous.exit_code != result.exit_code
+                            || previous.stdout != result.stdout
+                            || previous.stderr != result.stderr
+                    });
+
+                    self.state.command_results.insert(key, result);
                 }
             }
             Event::SessionUpdate(session_info, _) => {
@@ -461,5 +476,53 @@ mod test {
             state.state.command_results["command_branch"].context["timestamp"],
             original_timestamp
         );
+    }
+
+    #[test]
+    fn run_command_result_renders_only_when_output_changes() {
+        let mut state = State::default();
+
+        let ctx_t1 = BTreeMap::from([
+            ("name".to_owned(), "command_branch".to_owned()),
+            ("timestamp".to_owned(), "100".to_owned()),
+        ]);
+        assert!(state.handle_event(Event::RunCommandResult(
+            Some(0),
+            b"main\n".to_vec(),
+            Vec::new(),
+            ctx_t1,
+        )));
+
+        // Identical output with a newer timestamp must not schedule a repaint.
+        let ctx_t2 = BTreeMap::from([
+            ("name".to_owned(), "command_branch".to_owned()),
+            ("timestamp".to_owned(), "105".to_owned()),
+        ]);
+        assert!(!state.handle_event(Event::RunCommandResult(
+            Some(0),
+            b"main\n".to_vec(),
+            Vec::new(),
+            ctx_t2.clone(),
+        )));
+
+        // Changed stdout, stderr, or exit_code must schedule a repaint.
+        assert!(state.handle_event(Event::RunCommandResult(
+            Some(0),
+            b"feat\n".to_vec(),
+            Vec::new(),
+            ctx_t2.clone(),
+        )));
+        assert!(state.handle_event(Event::RunCommandResult(
+            Some(1),
+            b"feat\n".to_vec(),
+            Vec::new(),
+            ctx_t2.clone(),
+        )));
+        assert!(state.handle_event(Event::RunCommandResult(
+            Some(1),
+            b"feat\n".to_vec(),
+            b"err\n".to_vec(),
+            ctx_t2,
+        )));
     }
 }
