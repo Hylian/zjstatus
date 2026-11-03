@@ -111,6 +111,7 @@ impl ZellijPlugin for State {
             incoming_notification: None,
             focused_pane_id: None,
             focused_pane_cwd: None,
+            command_epochs: BTreeMap::new(),
         };
     }
 
@@ -232,7 +233,6 @@ impl State {
     fn invalidate_focus_cwd_commands(&mut self) {
         for name in &self.focus_cwd_commands {
             pipe::invalidate_command_result(&mut self.state, name);
-            zjstatus::widgets::command::release_command_lock(&self.state, name);
         }
     }
 
@@ -317,6 +317,29 @@ impl State {
                         && context.get("cwd").map(PathBuf::from) != self.state.focused_pane_cwd
                     {
                         tracing::debug!("discarding stale command result for {name}");
+                        return false;
+                    }
+
+                    let current_epoch = self.state.command_epochs.get(name).copied().unwrap_or(0);
+                    if let Some(res_epoch) =
+                        context.get("epoch").and_then(|s| s.parse::<u64>().ok())
+                        && res_epoch < current_epoch
+                    {
+                        tracing::debug!("discarding pre-invalidation command result for {name}");
+                        return false;
+                    }
+
+                    if let Some(previous) = self.state.command_results.get(name)
+                        && let (Some(prev_seq), Some(res_seq)) = (
+                            previous
+                                .context
+                                .get("seq")
+                                .and_then(|s| s.parse::<u64>().ok()),
+                            context.get("seq").and_then(|s| s.parse::<u64>().ok()),
+                        )
+                        && res_seq <= prev_seq
+                    {
+                        tracing::debug!("discarding out-of-order command result for {name}");
                         return false;
                     }
 
@@ -460,6 +483,76 @@ mod test {
         assert_ne!(
             state.state.command_results["command_branch"].context["timestamp"],
             original_timestamp
+        );
+    }
+
+    #[test]
+    fn run_command_result_discards_stale_epoch_and_out_of_order_seq() {
+        let mut state = State::default();
+
+        // Accept seq 2 in epoch 0.
+        state.handle_event(Event::RunCommandResult(
+            Some(0),
+            b"new\n".to_vec(),
+            Vec::new(),
+            BTreeMap::from([
+                ("name".to_owned(), "command_branch".to_owned()),
+                ("epoch".to_owned(), "0".to_owned()),
+                ("seq".to_owned(), "2".to_owned()),
+            ]),
+        ));
+        assert_eq!(
+            state.state.command_results["command_branch"].stdout,
+            "new\n"
+        );
+
+        // Out-of-order seq 1 from the same epoch must be rejected.
+        state.handle_event(Event::RunCommandResult(
+            Some(0),
+            b"old\n".to_vec(),
+            Vec::new(),
+            BTreeMap::from([
+                ("name".to_owned(), "command_branch".to_owned()),
+                ("epoch".to_owned(), "0".to_owned()),
+                ("seq".to_owned(), "1".to_owned()),
+            ]),
+        ));
+        assert_eq!(
+            state.state.command_results["command_branch"].stdout,
+            "new\n"
+        );
+
+        // Bump epoch via rerun invalidation; pre-invalidation seq 3 (epoch 0) is rejected,
+        // while post-invalidation seq 4 (epoch 1) is accepted.
+        pipe::invalidate_command_result(&mut state.state, "command_branch");
+        state.handle_event(Event::RunCommandResult(
+            Some(0),
+            b"pre_rerun\n".to_vec(),
+            Vec::new(),
+            BTreeMap::from([
+                ("name".to_owned(), "command_branch".to_owned()),
+                ("epoch".to_owned(), "0".to_owned()),
+                ("seq".to_owned(), "3".to_owned()),
+            ]),
+        ));
+        assert_eq!(
+            state.state.command_results["command_branch"].stdout,
+            "new\n"
+        );
+
+        state.handle_event(Event::RunCommandResult(
+            Some(0),
+            b"post_rerun\n".to_vec(),
+            Vec::new(),
+            BTreeMap::from([
+                ("name".to_owned(), "command_branch".to_owned()),
+                ("epoch".to_owned(), "1".to_owned()),
+                ("seq".to_owned(), "4".to_owned()),
+            ]),
+        ));
+        assert_eq!(
+            state.state.command_results["command_branch"].stdout,
+            "post_rerun\n"
         );
     }
 }
