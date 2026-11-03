@@ -61,6 +61,17 @@ impl ZellijPlugin for State {
         #[cfg(feature = "tracing")]
         init_tracing();
 
+        self.pending_events = Vec::new();
+        self.got_permissions = false;
+        self.err = None;
+        self.module_config = match ModuleConfig::new(&configuration) {
+            Ok(mc) => mc,
+            Err(e) => {
+                self.err = Some(e);
+                ModuleConfig::default()
+            }
+        };
+
         // we need the ReadApplicationState permission to receive the ModeUpdate and TabUpdate
         // events
         // we need the RunCommands permission to run "cargo test" in a floating window
@@ -70,32 +81,17 @@ impl ZellijPlugin for State {
             PermissionType::RunCommands,
         ]);
 
-        subscribe(&[
-            EventType::Mouse,
-            EventType::ModeUpdate,
-            EventType::PaneUpdate,
-            EventType::PermissionRequestResult,
-            EventType::Timer,
-            EventType::TabUpdate,
-            EventType::SessionUpdate,
-            EventType::RunCommandResult,
-            EventType::CwdChanged,
-        ]);
+        subscribe(&subscribed_events(&self.frame_config()));
         set_timeout(REFRESH_INTERVAL_SECONDS);
 
-        self.module_config = match ModuleConfig::new(&configuration) {
-            Ok(mc) => mc,
-            Err(e) => {
-                self.err = Some(e);
-                return;
-            }
-        };
+        if self.err.is_some() {
+            return;
+        }
+
         self.widget_map = register_widgets(&configuration);
         self.focus_cwd_commands =
             zjstatus::widgets::command::focus_cwd_command_names(&configuration);
         self.userspace_configuration = configuration;
-        self.pending_events = Vec::new();
-        self.got_permissions = false;
         let uid = Uuid::new_v4();
 
         self.state = ZellijState {
@@ -204,6 +200,16 @@ fn query_pane_cwd(_pane_id: PaneId) -> std::result::Result<PathBuf, String> {
 }
 
 impl State {
+    fn frame_config(&self) -> frames::FrameConfig {
+        frames::FrameConfig::new(
+            self.module_config.hide_frame_for_single_pane,
+            self.module_config.hide_frame_except_for_search,
+            self.module_config.hide_frame_except_for_fullscreen,
+            self.module_config.hide_frame_except_for_scroll,
+            &self.module_config.pane_frame_style,
+        )
+    }
+
     fn update_focused_pane(&mut self) -> bool {
         self.update_focused_pane_with(query_pane_cwd)
     }
@@ -303,20 +309,17 @@ impl State {
                 tracing::Span::current().record("event_type", "Event::PaneUpdate");
                 tracing::debug!(pane_count = ?pane_info.panes.len());
 
-                frames::hide_frames_conditionally(
-                    &frames::FrameConfig::new(
-                        self.module_config.hide_frame_for_single_pane,
-                        self.module_config.hide_frame_except_for_search,
-                        self.module_config.hide_frame_except_for_fullscreen,
-                        self.module_config.hide_frame_except_for_scroll,
-                        &self.module_config.pane_frame_style,
-                    ),
-                    &self.state.tabs,
-                    &pane_info,
-                    &self.state.mode,
-                    get_plugin_ids(),
-                    false,
-                );
+                let frame_config = self.frame_config();
+                if !frame_config.is_disabled() {
+                    frames::hide_frames_conditionally(
+                        &frame_config,
+                        &self.state.tabs,
+                        &pane_info,
+                        &self.state.mode,
+                        get_plugin_ids(),
+                        false,
+                    );
+                }
 
                 self.prune_closed_pane_cwds(&pane_info);
                 self.state.panes = pane_info;
@@ -429,17 +432,13 @@ impl State {
             Event::SessionUpdate(session_info, _) => {
                 tracing::Span::current().record("event_type", "Event::SessionUpdate");
 
-                let current_session = session_info.iter().find(|s| s.is_current_session);
-
-                if let Some(current_session) = current_session {
+                let frame_config = self.frame_config();
+                if !frame_config.is_disabled()
+                    && let Some(current_session) =
+                        session_info.iter().find(|s| s.is_current_session)
+                {
                     frames::hide_frames_conditionally(
-                        &frames::FrameConfig::new(
-                            self.module_config.hide_frame_for_single_pane,
-                            self.module_config.hide_frame_except_for_search,
-                            self.module_config.hide_frame_except_for_fullscreen,
-                            self.module_config.hide_frame_except_for_scroll,
-                            &self.module_config.pane_frame_style,
-                        ),
+                        &frame_config,
                         &current_session.tabs,
                         &current_session.panes,
                         &self.state.mode,
@@ -478,6 +477,23 @@ impl State {
         };
         should_render
     }
+}
+
+fn subscribed_events(frame_config: &frames::FrameConfig) -> Vec<EventType> {
+    let mut events = vec![
+        EventType::Mouse,
+        EventType::ModeUpdate,
+        EventType::PaneUpdate,
+        EventType::PermissionRequestResult,
+        EventType::Timer,
+        EventType::TabUpdate,
+        EventType::RunCommandResult,
+        EventType::CwdChanged,
+    ];
+    if !frame_config.is_disabled() {
+        events.push(EventType::SessionUpdate);
+    }
+    events
 }
 
 fn register_widgets(configuration: &BTreeMap<String, String>) -> BTreeMap<String, Arc<dyn Widget>> {
@@ -778,5 +794,17 @@ mod test {
             state.state.command_results["command_branch"].stdout,
             "post_rerun\n"
         );
+    }
+
+    #[test]
+    fn subscribes_to_session_update_only_when_frame_hiding_enabled() {
+        let disabled = frames::FrameConfig::new(false, false, false, false, "titles");
+        assert!(!subscribed_events(&disabled).contains(&EventType::SessionUpdate));
+
+        let single_pane = frames::FrameConfig::new(true, false, false, false, "titles");
+        assert!(subscribed_events(&single_pane).contains(&EventType::SessionUpdate));
+
+        let scroll = frames::FrameConfig::new(false, false, false, true, "full");
+        assert!(subscribed_events(&scroll).contains(&EventType::SessionUpdate));
     }
 }
