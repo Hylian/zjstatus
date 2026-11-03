@@ -27,6 +27,7 @@ pub struct ZellijState {
     pub focused_pane_id: Option<PaneId>,
     pub focused_pane_cwd: Option<std::path::PathBuf>,
     pub command_epochs: BTreeMap<String, u64>,
+    pub cached_command_fallbacks: BTreeMap<String, (String, String)>,
 }
 
 #[derive(Clone, Debug, Ord, Eq, PartialEq, PartialOrd, Copy)]

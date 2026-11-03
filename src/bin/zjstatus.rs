@@ -32,6 +32,8 @@ struct State {
     module_config: config::ModuleConfig,
     widget_map: BTreeMap<String, Arc<dyn Widget>>,
     focus_cwd_commands: Vec<String>,
+    disk_cache_commands: Vec<String>,
+    loaded_disk_cache_session: Option<Option<String>>,
     err: Option<anyhow::Error>,
     pane_cwds: BTreeMap<PaneId, PathBuf>,
 }
@@ -91,6 +93,9 @@ impl ZellijPlugin for State {
         self.widget_map = register_widgets(&configuration);
         self.focus_cwd_commands =
             zjstatus::widgets::command::focus_cwd_command_names(&configuration);
+        self.disk_cache_commands =
+            zjstatus::widgets::command::disk_cached_command_names(&configuration);
+        self.loaded_disk_cache_session = None;
         self.userspace_configuration = configuration;
         let uid = Uuid::new_v4();
 
@@ -109,6 +114,7 @@ impl ZellijPlugin for State {
             focused_pane_id: None,
             focused_pane_cwd: None,
             command_epochs: BTreeMap::new(),
+            cached_command_fallbacks: BTreeMap::new(),
         };
         self.pane_cwds = BTreeMap::new();
     }
@@ -178,6 +184,7 @@ impl ZellijPlugin for State {
         }
 
         self.state.cols = cols;
+        self.ensure_disk_cache_loaded();
 
         tracing::debug!("{:?}", self.state.mode.session_name);
 
@@ -208,6 +215,44 @@ impl State {
             self.module_config.hide_frame_except_for_scroll,
             &self.module_config.pane_frame_style,
         )
+    }
+
+    fn ensure_disk_cache_loaded(&mut self) {
+        self.ensure_disk_cache_loaded_with(zjstatus::widgets::command::read_cached_command_entry);
+    }
+
+    fn ensure_disk_cache_loaded_with(
+        &mut self,
+        mut read_entry: impl FnMut(Option<&str>, &str) -> Option<(String, String)>,
+    ) {
+        if self.disk_cache_commands.is_empty() {
+            return;
+        }
+
+        if self
+            .loaded_disk_cache_session
+            .as_ref()
+            .is_some_and(|loaded| loaded == &self.state.mode.session_name)
+        {
+            return;
+        }
+
+        let current_session = self.state.mode.session_name.clone();
+        self.loaded_disk_cache_session = Some(current_session.clone());
+
+        for name in &self.disk_cache_commands {
+            if self.state.command_results.contains_key(name) {
+                continue;
+            }
+
+            if let Some(entry) = read_entry(current_session.as_deref(), name) {
+                self.state
+                    .cached_command_fallbacks
+                    .insert(name.clone(), entry);
+            } else {
+                self.state.cached_command_fallbacks.remove(name);
+            }
+        }
     }
 
     fn update_focused_pane(&mut self) -> bool {
@@ -425,6 +470,16 @@ impl State {
                             || previous.stdout != result.stdout
                             || previous.stderr != result.stderr
                     });
+
+                    self.state.cached_command_fallbacks.remove(&key);
+                    if self.disk_cache_commands.iter().any(|n| n == &key) {
+                        zjstatus::widgets::command::write_cached_command_result(
+                            self.state.mode.session_name.as_deref(),
+                            &key,
+                            &self.state.plugin_uuid,
+                            &result,
+                        );
+                    }
 
                     self.state.command_results.insert(key, result);
                 }
@@ -806,5 +861,52 @@ mod test {
 
         let scroll = frames::FrameConfig::new(false, false, false, true, "full");
         assert!(subscribed_events(&scroll).contains(&EventType::SessionUpdate));
+    }
+
+    #[test]
+    fn disk_cache_loads_once_per_session_and_evicts_on_live_result() {
+        let mut state = State {
+            disk_cache_commands: vec!["command_host".to_owned(), "command_branch".to_owned()],
+            ..State::default()
+        };
+        state.state.mode.session_name = Some("work".to_owned());
+
+        let mut reads = 0usize;
+        state.ensure_disk_cache_loaded_with(|session, name| {
+            reads += 1;
+            assert_eq!(session, Some("work"));
+            Some((format!("/{name}"), format!("cached-{name}\n")))
+        });
+        assert_eq!(reads, 2);
+
+        // Subsequent renders in the same session must not re-read disk.
+        state.ensure_disk_cache_loaded_with(|_, _| {
+            reads += 1;
+            None
+        });
+        assert_eq!(reads, 2);
+
+        // Live result evicts the fallback for that command.
+        state.handle_event(Event::RunCommandResult(
+            Some(0),
+            b"live-host\n".to_vec(),
+            Vec::new(),
+            BTreeMap::from([("name".to_owned(), "command_host".to_owned())]),
+        ));
+        assert!(
+            !state
+                .state
+                .cached_command_fallbacks
+                .contains_key("command_host")
+        );
+
+        // Explicit rerun invalidation also drops any remaining fallback.
+        pipe::invalidate_command_result(&mut state.state, "command_branch");
+        assert!(
+            !state
+                .state
+                .cached_command_fallbacks
+                .contains_key("command_branch")
+        );
     }
 }

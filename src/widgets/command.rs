@@ -116,11 +116,16 @@ impl Widget for CommandWidget {
 
         run_command_if_needed(command_config, name, state, &self.in_flight);
 
+        let fallback_result;
         let command_result = match state.command_results.get(name) {
             Some(cr) => cr,
-            None => {
-                return "".to_owned();
-            }
+            None => match fallback_command_result(command_config, name, state) {
+                Some(cr) => {
+                    fallback_result = cr;
+                    &fallback_result
+                }
+                None => return "".to_owned(),
+            },
         };
 
         if command_config.hide_on_empty_stdout && command_result.stdout.is_empty() {
@@ -325,6 +330,127 @@ pub fn focus_cwd_command_names(zj_conf: &BTreeMap<String, String>) -> Vec<String
         .filter(|(_, conf)| conf.follow_focus_cwd)
         .map(|(name, _)| name)
         .collect()
+}
+
+pub fn disk_cached_command_names(zj_conf: &BTreeMap<String, String>) -> Vec<String> {
+    parse_config(zj_conf)
+        .into_iter()
+        .filter(|(_, conf)| conf.interval != 0)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+pub fn sanitize_cache_token(raw: Option<&str>) -> String {
+    let Some(s) = raw.filter(|s| !s.is_empty()) else {
+        return "_unassigned".to_owned();
+    };
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub fn write_cached_command_result(
+    session_name: Option<&str>,
+    name: &str,
+    plugin_uuid: &str,
+    result: &CommandResult,
+) {
+    if cfg!(all(not(feature = "bench"), not(test))) {
+        write_cached_command_result_in(Path::new("/tmp"), session_name, name, plugin_uuid, result);
+    }
+}
+
+pub fn read_cached_command_entry(
+    session_name: Option<&str>,
+    name: &str,
+) -> Option<(String, String)> {
+    if cfg!(all(not(feature = "bench"), not(test))) {
+        read_cached_command_entry_in(Path::new("/tmp"), session_name, name)
+    } else {
+        None
+    }
+}
+
+pub fn write_cached_command_result_in(
+    cache_dir: &Path,
+    session_name: Option<&str>,
+    name: &str,
+    plugin_uuid: &str,
+    result: &CommandResult,
+) {
+    if result.exit_code != Some(0) {
+        return;
+    }
+
+    let cwd = result.context.get("cwd").map(String::as_str).unwrap_or("");
+    if cwd.contains('\n') || cwd.contains('\r') {
+        return;
+    }
+
+    let session_tok = sanitize_cache_token(session_name);
+    let name_tok = sanitize_cache_token(Some(name));
+    let uuid_tok = sanitize_cache_token(Some(plugin_uuid));
+    let payload = format!("cwd:{cwd}\n{}", result.stdout);
+
+    let final_path = cache_dir.join(format!("zjstatus-cmd-cache.{session_tok}.{name_tok}"));
+    let tmp_path = cache_dir.join(format!(
+        ".zjstatus-cmd-cache.{session_tok}.{name_tok}.{uuid_tok}.tmp"
+    ));
+
+    if std::fs::write(&tmp_path, &payload).is_ok() {
+        if std::fs::rename(&tmp_path, &final_path).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::write(&final_path, &payload);
+        }
+    } else {
+        let _ = std::fs::write(&final_path, &payload);
+    }
+}
+
+pub fn read_cached_command_entry_in(
+    cache_dir: &Path,
+    session_name: Option<&str>,
+    name: &str,
+) -> Option<(String, String)> {
+    let session_tok = sanitize_cache_token(session_name);
+    let name_tok = sanitize_cache_token(Some(name));
+    let path = cache_dir.join(format!("zjstatus-cmd-cache.{session_tok}.{name_tok}"));
+    let raw = std::fs::read_to_string(path).ok()?;
+    let rest = raw.strip_prefix("cwd:")?;
+    let (cached_cwd, stdout) = rest.split_once('\n')?;
+    Some((cached_cwd.to_owned(), stdout.to_owned()))
+}
+
+fn fallback_command_result(
+    command_config: &CommandConfig,
+    name: &str,
+    state: &ZellijState,
+) -> Option<CommandResult> {
+    if command_config.interval == 0 {
+        return None;
+    }
+
+    let (cached_cwd, stdout) = state.cached_command_fallbacks.get(name)?;
+
+    if command_config.follow_focus_cwd {
+        let actual_cwd = state.focused_pane_cwd.as_deref()?;
+        if cached_cwd.is_empty() || Path::new(cached_cwd) != actual_cwd {
+            return None;
+        }
+    }
+
+    Some(CommandResult {
+        exit_code: Some(0),
+        stdout: stdout.clone(),
+        stderr: String::new(),
+        context: BTreeMap::new(),
+    })
 }
 
 fn parse_config(zj_conf: &BTreeMap<String, String>) -> BTreeMap<String, CommandConfig> {
@@ -707,5 +833,112 @@ mod test {
             &tracker,
         );
         assert_eq!(res, expected);
+    }
+
+    #[test]
+    pub fn test_disk_cache_isolates_sessions_and_guards_cwd_and_exit_code() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("zjstatus-test-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let ok_result = CommandResult {
+            exit_code: Some(0),
+            stdout: "ssh-host\n".to_owned(),
+            stderr: String::new(),
+            context: BTreeMap::from([("cwd".to_owned(), "/repo-a".to_owned())]),
+        };
+        let err_result = CommandResult {
+            exit_code: Some(1),
+            stdout: "broken\n".to_owned(),
+            stderr: "err".to_owned(),
+            context: BTreeMap::from([("cwd".to_owned(), "/repo-a".to_owned())]),
+        };
+
+        write_cached_command_result_in(
+            &temp_dir,
+            Some("remote"),
+            "command_host",
+            "uuid-1",
+            &ok_result,
+        );
+        // Non-zero exit codes must never overwrite or populate the disk cache.
+        write_cached_command_result_in(
+            &temp_dir,
+            Some("remote"),
+            "command_host",
+            "uuid-1",
+            &err_result,
+        );
+        write_cached_command_result_in(
+            &temp_dir,
+            Some("local"),
+            "command_failing",
+            "uuid-2",
+            &err_result,
+        );
+
+        assert_eq!(
+            read_cached_command_entry_in(&temp_dir, Some("remote"), "command_host"),
+            Some(("/repo-a".to_owned(), "ssh-host\n".to_owned()))
+        );
+        // Different Zellij session under the same UID must not see "remote"'s cache.
+        assert_eq!(
+            read_cached_command_entry_in(&temp_dir, Some("local"), "command_host"),
+            None
+        );
+        assert_eq!(
+            read_cached_command_entry_in(&temp_dir, Some("local"), "command_failing"),
+            None
+        );
+
+        let conf = BTreeMap::from([
+            ("command_branch_command".to_owned(), "git status".to_owned()),
+            (
+                "command_branch_cwd".to_owned(),
+                "{focused_pane_cwd}".to_owned(),
+            ),
+            ("command_branch_format".to_owned(), "{stdout}".to_owned()),
+            ("command_host_command".to_owned(), "hostname".to_owned()),
+            ("command_host_format".to_owned(), "{stdout}".to_owned()),
+            ("command_once_command".to_owned(), "uname".to_owned()),
+            ("command_once_interval".to_owned(), "0".to_owned()),
+            ("command_once_format".to_owned(), "{stdout}".to_owned()),
+        ]);
+        assert_eq!(
+            disk_cached_command_names(&conf),
+            vec!["command_branch".to_owned(), "command_host".to_owned()]
+        );
+
+        let widget = CommandWidget::new(&conf);
+        let mut state = ZellijState {
+            cached_command_fallbacks: BTreeMap::from([
+                (
+                    "command_branch".to_owned(),
+                    ("/repo-a".to_owned(), "main\n".to_owned()),
+                ),
+                (
+                    "command_host".to_owned(),
+                    (String::new(), "box\n".to_owned()),
+                ),
+                (
+                    "command_once".to_owned(),
+                    (String::new(), "linux\n".to_owned()),
+                ),
+            ]),
+            ..ZellijState::default()
+        };
+
+        // Non-CWD command renders immediately on frame 0; interval == 0 never uses disk fallback.
+        assert_eq!(widget.process("command_host", &state), "box");
+        assert_eq!(widget.process("command_once", &state), "");
+
+        // Focus-CWD command rejects unknown (None) and mismatched CWDs, accepting only exact match.
+        assert_eq!(widget.process("command_branch", &state), "");
+        state.focused_pane_cwd = Some(PathBuf::from("/repo-b"));
+        assert_eq!(widget.process("command_branch", &state), "");
+        state.focused_pane_cwd = Some(PathBuf::from("/repo-a"));
+        assert_eq!(widget.process("command_branch", &state), "main");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

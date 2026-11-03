@@ -108,6 +108,7 @@ pub fn invalidate_command_result(state: &mut ZellijState, command_name: &str) {
         .command_epochs
         .entry(command_name.to_owned())
         .or_insert(0) += 1;
+    state.cached_command_fallbacks.remove(command_name);
 
     let Some(mut command_result) = state.command_results.get(command_name).cloned() else {
         return;
