@@ -1,10 +1,11 @@
 use kdl::{KdlDocument, KdlError};
 use lazy_static::lazy_static;
 use std::{
-    collections::BTreeMap,
-    fs::{File, remove_file},
+    collections::{BTreeMap, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     ops::Sub,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicI64, AtomicU64, Ordering},
 };
 
 use chrono::{DateTime, Duration, Local};
@@ -17,6 +18,7 @@ use crate::render::{FormattedPart, formatted_parts_from_string_cached};
 use crate::{config::ZellijState, widgets::widget::Widget};
 
 pub const TIMESTAMP_FORMAT: &str = "%s";
+const IN_FLIGHT_TIMEOUT_SECS: i64 = 30;
 
 lazy_static! {
     static ref COMMAND_REGEX: Regex = Regex::new("_[a-zA-Z0-9]+$").unwrap();
@@ -52,16 +54,53 @@ pub struct CommandResult {
     pub context: BTreeMap<String, String>,
 }
 
+#[derive(Default, Debug)]
+struct InFlightTracker {
+    next_seq: AtomicU64,
+    slots: BTreeMap<String, InFlightSlot>,
+}
+
+impl InFlightTracker {
+    fn from_config(config: &BTreeMap<String, CommandConfig>) -> Self {
+        let slots = config
+            .keys()
+            .map(|name| (name.clone(), InFlightSlot::default()))
+            .collect();
+        Self {
+            next_seq: AtomicU64::new(0),
+            slots,
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct InFlightSlot {
+    seq: AtomicU64,
+    epoch: AtomicU64,
+    cwd_hash: AtomicU64,
+    spawned_at_secs: AtomicI64,
+}
+
+fn hash_cwd(cwd: Option<&Path>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub struct CommandWidget {
     config: BTreeMap<String, CommandConfig>,
     zj_conf: BTreeMap<String, String>,
+    in_flight: InFlightTracker,
 }
 
 impl CommandWidget {
     pub fn new(config: &BTreeMap<String, String>) -> Self {
+        let parsed = parse_config(config);
+        let in_flight = InFlightTracker::from_config(&parsed);
         Self {
-            config: parse_config(config),
+            config: parsed,
             zj_conf: config.clone(),
+            in_flight,
         }
     }
 }
@@ -75,7 +114,7 @@ impl Widget for CommandWidget {
             }
         };
 
-        run_command_if_needed(command_config.clone(), name, state);
+        run_command_if_needed(command_config, name, state, &self.in_flight);
 
         let command_result = match state.command_results.get(name) {
             Some(cr) => cr,
@@ -175,15 +214,30 @@ fn render_dynamic_formatted_content(content: &str, config: &BTreeMap<String, Str
         .join("")
 }
 
-#[tracing::instrument(skip(command_config, state))]
-fn run_command_if_needed(command_config: CommandConfig, name: &str, state: &ZellijState) -> bool {
-    let got_result = state.command_results.contains_key(name);
-    if got_result && command_config.interval == 0 {
-        return false;
+#[tracing::instrument(skip(command_config, state, tracker))]
+fn run_command_if_needed(
+    command_config: &CommandConfig,
+    name: &str,
+    state: &ZellijState,
+    tracker: &InFlightTracker,
+) -> bool {
+    let current_epoch = state.command_epochs.get(name).copied().unwrap_or(0);
+
+    if command_config.interval == 0
+        && let Some(existing) = state.command_results.get(name)
+    {
+        let result_epoch = existing
+            .context
+            .get("epoch")
+            .and_then(|e| e.parse::<u64>().ok())
+            .unwrap_or(0);
+        if result_epoch == current_epoch {
+            return false;
+        }
     }
 
     let ts = Local::now();
-    let last_run = get_timestamp_from_event_or_default(name, state, command_config.interval);
+    let last_run = get_timestamp_from_event_or_default(name, state);
 
     if ts.timestamp() - last_run.timestamp() >= command_config.interval {
         let cwd = if command_config.follow_focus_cwd {
@@ -195,12 +249,43 @@ fn run_command_if_needed(command_config: CommandConfig, name: &str, state: &Zell
             command_config.cwd.clone()
         };
 
+        let completed_seq = state
+            .command_results
+            .get(name)
+            .and_then(|r| r.context.get("seq"))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let cwd_hash = hash_cwd(cwd.as_deref());
+
+        if let Some(slot) = tracker.slots.get(name) {
+            let in_flight_seq = slot.seq.load(Ordering::Relaxed);
+            if in_flight_seq > completed_seq
+                && slot.epoch.load(Ordering::Relaxed) == current_epoch
+                && slot.cwd_hash.load(Ordering::Relaxed) == cwd_hash
+                && (0..IN_FLIGHT_TIMEOUT_SECS)
+                    .contains(&(ts.timestamp() - slot.spawned_at_secs.load(Ordering::Relaxed)))
+            {
+                return false;
+            }
+        }
+
+        let seq = tracker.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(slot) = tracker.slots.get(name) {
+            slot.seq.store(seq, Ordering::Relaxed);
+            slot.epoch.store(current_epoch, Ordering::Relaxed);
+            slot.cwd_hash.store(cwd_hash, Ordering::Relaxed);
+            slot.spawned_at_secs
+                .store(ts.timestamp(), Ordering::Relaxed);
+        }
+
         let mut context = BTreeMap::new();
         context.insert("name".to_owned(), name.to_owned());
         context.insert(
             "timestamp".to_owned(),
             ts.format(TIMESTAMP_FORMAT).to_string(),
         );
+        context.insert("epoch".to_owned(), current_epoch.to_string());
+        context.insert("seq".to_owned(), seq.to_string());
 
         if let Some(cwd) = &cwd {
             context.insert("cwd".to_owned(), cwd.to_string_lossy().into_owned());
@@ -214,7 +299,7 @@ fn run_command_if_needed(command_config: CommandConfig, name: &str, state: &Zell
             #[cfg(all(not(feature = "bench"), not(test)))]
             run_command_with_env_variables_and_cwd(
                 &command.iter().map(|x| x.as_str()).collect::<Vec<&str>>(),
-                command_config.env.unwrap_or_default(),
+                command_config.env.clone().unwrap_or_default(),
                 cwd.unwrap_or_default(),
                 context,
             );
@@ -360,54 +445,18 @@ fn get_env_vars(doc: KdlDocument) -> BTreeMap<String, String> {
     output
 }
 
-fn get_timestamp_from_event_or_default(
-    name: &str,
-    state: &ZellijState,
-    interval: i64,
-) -> DateTime<Local> {
-    let command_result = state.command_results.get(name);
-    if command_result.is_none() {
-        if lock(name, state.clone()) {
-            return Local::now();
-        }
-
+fn get_timestamp_from_event_or_default(name: &str, state: &ZellijState) -> DateTime<Local> {
+    let Some(command_result) = state.command_results.get(name) else {
         return Sub::<Duration>::sub(Local::now(), Duration::try_days(1).unwrap());
-    }
-    let command_result = command_result.unwrap();
+    };
 
-    let ts_context = command_result.context.get("timestamp");
-    if ts_context.is_none() {
+    let Some(ts_context) = command_result.context.get("timestamp") else {
         return Sub::<Duration>::sub(Local::now(), Duration::try_days(1).unwrap());
-    }
-    let ts_context = ts_context.unwrap();
-
-    if Local::now().timestamp() - state.start_time.timestamp() < interval {
-        release_command_lock(state, name);
-    }
+    };
 
     match DateTime::parse_from_str(ts_context, TIMESTAMP_FORMAT) {
         Ok(ts) => ts.into(),
         Err(_) => Sub::<Duration>::sub(Local::now(), Duration::try_days(1).unwrap()),
-    }
-}
-
-fn lock(name: &str, state: ZellijState) -> bool {
-    let path = format!("/tmp/{}.{}.lock", state.plugin_uuid, name);
-
-    if !Path::new(&path).exists() {
-        let _ = File::create(path);
-
-        return false;
-    }
-
-    true
-}
-
-pub fn release_command_lock(state: &ZellijState, name: &str) {
-    let path = format!("/tmp/{}.{}.lock", state.plugin_uuid, name);
-
-    if Path::new(&path).exists() {
-        let _ = remove_file(path);
     }
 }
 
@@ -511,45 +560,90 @@ mod test {
     }
 
     #[test]
-    pub fn test_release_command_lock_allows_rerun_without_result() {
-        let state = ZellijState {
-            plugin_uuid: "release_command_lock_test".to_owned(),
+    pub fn test_in_flight_deduplicates_reruns_and_unblocks_on_invalidation_or_completion() {
+        let mut state = ZellijState {
+            focused_pane_cwd: Some(PathBuf::from("/repo-a")),
             ..ZellijState::default()
         };
         let command_config = CommandConfig {
-            command: "echo test".to_owned(),
+            command: "git status".to_owned(),
             format: Vec::new(),
             env: None,
             cwd: None,
-            follow_focus_cwd: false,
+            follow_focus_cwd: true,
             interval: 5,
             render_mode: RenderMode::Static,
             click_action: "".to_owned(),
             hide_on_empty_stdout: false,
         };
+        let tracker = InFlightTracker {
+            next_seq: AtomicU64::new(0),
+            slots: BTreeMap::from([("command_git_branch".to_owned(), InFlightSlot::default())]),
+        };
 
-        release_command_lock(&state, "test_release");
-
+        // First spawn succeeds; duplicate renders while in flight are suppressed.
         assert!(run_command_if_needed(
-            command_config.clone(),
-            "test_release",
-            &state
+            &command_config,
+            "command_git_branch",
+            &state,
+            &tracker
         ));
         assert!(!run_command_if_needed(
-            command_config.clone(),
-            "test_release",
-            &state
+            &command_config,
+            "command_git_branch",
+            &state,
+            &tracker
         ));
 
-        release_command_lock(&state, "test_release");
-
+        // Explicit invalidation (even before any result lands) unblocks a fresh run.
+        crate::pipe::invalidate_command_result(&mut state, "command_git_branch");
         assert!(run_command_if_needed(
-            command_config,
-            "test_release",
-            &state
+            &command_config,
+            "command_git_branch",
+            &state,
+            &tracker
+        ));
+        assert!(!run_command_if_needed(
+            &command_config,
+            "command_git_branch",
+            &state,
+            &tracker
         ));
 
-        release_command_lock(&state, "test_release");
+        // Recording a completed result with seq == 2 and expired timestamp allows the next
+        // scheduled interval run, while deduplicating subsequent renders until seq == 3 lands.
+        state.command_results.insert(
+            "command_git_branch".to_owned(),
+            CommandResult {
+                context: BTreeMap::from([
+                    ("timestamp".to_owned(), "0".to_owned()),
+                    ("epoch".to_owned(), "1".to_owned()),
+                    ("seq".to_owned(), "2".to_owned()),
+                ]),
+                ..CommandResult::default()
+            },
+        );
+        assert!(run_command_if_needed(
+            &command_config,
+            "command_git_branch",
+            &state,
+            &tracker
+        ));
+        assert!(!run_command_if_needed(
+            &command_config,
+            "command_git_branch",
+            &state,
+            &tracker
+        ));
+
+        // Moving to a different focused CWD unblocks immediately without waiting for seq == 3.
+        state.focused_pane_cwd = Some(PathBuf::from("/repo-b"));
+        assert!(run_command_if_needed(
+            &command_config,
+            "command_git_branch",
+            &state,
+            &tracker
+        ));
     }
 
     #[rstest]
@@ -592,8 +686,12 @@ mod test {
         #[case] state: &ZellijState,
         #[case] expected: bool,
     ) {
+        let tracker = InFlightTracker {
+            next_seq: AtomicU64::new(0),
+            slots: BTreeMap::from([("test".to_owned(), InFlightSlot::default())]),
+        };
         let res = run_command_if_needed(
-            CommandConfig {
+            &CommandConfig {
                 command: "echo test".to_owned(),
                 format: Vec::new(),
                 env: None,
@@ -606,9 +704,8 @@ mod test {
             },
             "test",
             state,
+            &tracker,
         );
         assert_eq!(res, expected);
-
-        release_command_lock(&state, "test");
     }
 }

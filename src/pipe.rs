@@ -100,16 +100,18 @@ fn rerun_command(state: &mut ZellijState, command_name: &str) {
     invalidate_command_result(state, command_name);
 }
 
-/// Backdates the stored timestamp of a command result so the next render
-/// re-runs the command.
+/// Advances the command's invalidation epoch and backdates any stored
+/// timestamp so the next render spawns a fresh run (and discards in-flight
+/// runs from earlier epochs).
 pub fn invalidate_command_result(state: &mut ZellijState, command_name: &str) {
-    let command_result = state.command_results.get(command_name);
+    *state
+        .command_epochs
+        .entry(command_name.to_owned())
+        .or_insert(0) += 1;
 
-    if command_result.is_none() {
+    let Some(mut command_result) = state.command_results.get(command_name).cloned() else {
         return;
-    }
-
-    let mut command_result = command_result.unwrap().clone();
+    };
 
     let ts = Sub::<Duration>::sub(Local::now(), Duration::try_days(1).unwrap());
 
@@ -118,8 +120,7 @@ pub fn invalidate_command_result(state: &mut ZellijState, command_name: &str) {
         ts.format(TIMESTAMP_FORMAT).to_string(),
     );
 
-    state.command_results.remove(command_name);
     state
         .command_results
-        .insert(command_name.to_string(), command_result.clone());
+        .insert(command_name.to_string(), command_result);
 }
