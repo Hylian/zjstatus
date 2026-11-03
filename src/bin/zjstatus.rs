@@ -33,6 +33,7 @@ struct State {
     widget_map: BTreeMap<String, Arc<dyn Widget>>,
     focus_cwd_commands: Vec<String>,
     err: Option<anyhow::Error>,
+    pane_cwds: BTreeMap<PaneId, PathBuf>,
 }
 
 #[cfg(not(test))]
@@ -112,25 +113,29 @@ impl ZellijPlugin for State {
             focused_pane_id: None,
             focused_pane_cwd: None,
         };
+        self.pane_cwds = BTreeMap::new();
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
         let mut should_render = false;
+        if !self.focus_cwd_commands.is_empty() && self.state.focused_pane_cwd.is_none() {
+            should_render |= self.update_focused_pane();
+        }
 
         match pipe_message.source {
             PipeSource::Cli(_) => {
                 if let Some(input) = pipe_message.payload {
-                    should_render = pipe::parse_protocol(&mut self.state, &input);
+                    should_render |= pipe::parse_protocol(&mut self.state, &input);
                 }
             }
             PipeSource::Plugin(_) => {
                 if let Some(input) = pipe_message.payload {
-                    should_render = pipe::parse_protocol(&mut self.state, &input);
+                    should_render |= pipe::parse_protocol(&mut self.state, &input);
                 }
             }
             PipeSource::Keybind => {
                 if let Some(input) = pipe_message.payload {
-                    should_render = pipe::parse_protocol(&mut self.state, &input);
+                    should_render |= pipe::parse_protocol(&mut self.state, &input);
                 }
             }
         }
@@ -142,13 +147,15 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         if let Event::PermissionRequestResult(PermissionStatus::Granted) = event {
             self.got_permissions = true;
+            let mut should_render = false;
 
-            while !self.pending_events.is_empty() {
+            for ev in std::mem::take(&mut self.pending_events) {
                 tracing::debug!("processing cached event");
-                let ev = self.pending_events.pop();
-
-                self.handle_event(ev.unwrap());
+                should_render |= self.handle_event(ev);
             }
+
+            should_render |= self.handle_event(event);
+            return should_render;
         }
 
         if !self.got_permissions {
@@ -185,8 +192,25 @@ impl ZellijPlugin for State {
     }
 }
 
+#[cfg(not(test))]
+fn query_pane_cwd(pane_id: PaneId) -> std::result::Result<PathBuf, String> {
+    get_pane_cwd(pane_id)
+}
+
+#[cfg(test)]
+fn query_pane_cwd(_pane_id: PaneId) -> std::result::Result<PathBuf, String> {
+    Err("not available in unit tests".to_owned())
+}
+
 impl State {
-    fn update_focused_pane(&mut self) {
+    fn update_focused_pane(&mut self) -> bool {
+        self.update_focused_pane_with(query_pane_cwd)
+    }
+
+    fn update_focused_pane_with(
+        &mut self,
+        fetch_cwd: impl FnOnce(PaneId) -> std::result::Result<PathBuf, String>,
+    ) -> bool {
         let active_tab = self.state.tabs.iter().find(|t| t.active);
 
         let new_id = active_tab
@@ -194,24 +218,40 @@ impl State {
             .and_then(|panes| panes.iter().find(|p| p.is_focused && !p.is_plugin))
             .map(|p| PaneId::Terminal(p.id));
 
-        if new_id == self.state.focused_pane_id {
-            return;
+        if new_id == self.state.focused_pane_id
+            && (new_id.is_none() || self.state.focused_pane_cwd.is_some())
+        {
+            return false;
         }
 
         self.state.focused_pane_id = new_id;
 
         let new_cwd = match new_id {
-            Some(pane_id) => match get_pane_cwd(pane_id) {
-                Ok(cwd) => Some(cwd),
+            Some(pane_id) => match fetch_cwd(pane_id) {
+                Ok(cwd) => {
+                    self.pane_cwds.insert(pane_id, cwd.clone());
+                    Some(cwd)
+                }
                 Err(e) => {
                     tracing::debug!("could not get pane cwd: {e}");
-                    None
+                    self.pane_cwds.get(&pane_id).cloned()
                 }
             },
             None => None,
         };
 
-        self.set_focused_pane_cwd(new_cwd);
+        self.set_focused_pane_cwd(new_cwd)
+    }
+
+    fn prune_closed_pane_cwds(&mut self, pane_info: &PaneManifest) {
+        self.pane_cwds.retain(|pane_id, _| match pane_id {
+            PaneId::Terminal(id) => pane_info
+                .panes
+                .values()
+                .flatten()
+                .any(|p| !p.is_plugin && p.id == *id),
+            PaneId::Plugin(_) => false,
+        });
     }
 
     fn set_focused_pane_cwd(&mut self, new_cwd: Option<PathBuf>) -> bool {
@@ -278,6 +318,7 @@ impl State {
                     false,
                 );
 
+                self.prune_closed_pane_cwds(&pane_info);
                 self.state.panes = pane_info;
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
 
@@ -288,6 +329,12 @@ impl State {
             Event::CwdChanged(pane_id, cwd, _clients) => {
                 tracing::Span::current().record("event_type", "Event::CwdChanged");
                 tracing::debug!(pane_id = ?pane_id, cwd = ?cwd);
+                self.pane_cwds.insert(pane_id, cwd.clone());
+
+                if self.state.focused_pane_id.is_none() && self.update_focused_pane() {
+                    self.state.cache_mask = UpdateEventMask::Command as u8;
+                    should_render = true;
+                }
 
                 if Some(pane_id) == self.state.focused_pane_id
                     && self.set_focused_pane_cwd(Some(cwd))
@@ -375,11 +422,16 @@ impl State {
                 self.state.cache_mask = UpdateEventMask::Tab as u8;
                 self.state.tabs = tab_info;
 
+                self.update_focused_pane();
+
                 should_render = true;
             }
             Event::Timer(_) => {
                 tracing::Span::current().record("event_type", "Event::Timer");
                 set_timeout(REFRESH_INTERVAL_SECONDS);
+                if !self.focus_cwd_commands.is_empty() && self.state.focused_pane_cwd.is_none() {
+                    self.update_focused_pane();
+                }
                 self.state.cache_mask = 0;
 
                 should_render = true;
@@ -460,6 +512,115 @@ mod test {
         assert_ne!(
             state.state.command_results["command_branch"].context["timestamp"],
             original_timestamp
+        );
+    }
+
+    #[test]
+    fn pending_events_replay_in_fifo_order_and_propagate_render() {
+        let mut state = State::default();
+        let pane = PaneId::Terminal(1);
+
+        assert!(!state.update(Event::CwdChanged(pane, PathBuf::from("/first"), Vec::new())));
+        assert!(!state.update(Event::CwdChanged(
+            pane,
+            PathBuf::from("/second"),
+            Vec::new(),
+        )));
+        assert!(!state.update(Event::ModeUpdate(ModeInfo::default())));
+
+        assert!(state.update(Event::PermissionRequestResult(PermissionStatus::Granted)));
+        assert_eq!(state.pane_cwds.get(&pane), Some(&PathBuf::from("/second")));
+    }
+
+    #[test]
+    fn update_focused_pane_retries_none_cwd_and_falls_back_on_timeout() {
+        let mut state = State {
+            focus_cwd_commands: vec!["command_branch".to_owned()],
+            ..State::default()
+        };
+        state.state.tabs = vec![TabInfo {
+            position: 0,
+            active: true,
+            ..TabInfo::default()
+        }];
+        state.state.panes.panes.insert(
+            0,
+            vec![
+                PaneInfo {
+                    id: 7,
+                    is_plugin: false,
+                    is_focused: true,
+                    ..PaneInfo::default()
+                },
+                PaneInfo {
+                    id: 8,
+                    is_plugin: false,
+                    is_focused: false,
+                    ..PaneInfo::default()
+                },
+            ],
+        );
+
+        // Initial timeout leaves focused_pane_cwd None, allowing retry on the same pane.
+        assert!(!state.update_focused_pane_with(|_| Err("GetPaneCwd timeout".to_owned())));
+        assert_eq!(state.state.focused_pane_id, Some(PaneId::Terminal(7)));
+        assert_eq!(state.state.focused_pane_cwd, None);
+
+        assert!(state.update_focused_pane_with(|_| Ok(PathBuf::from("/repo-a"))));
+        assert_eq!(state.state.focused_pane_cwd, Some(PathBuf::from("/repo-a")));
+
+        // Seed pane 8 via asynchronous CwdChanged, then switch focus to pane 8 while
+        // GetPaneCwd times out: pane_cwds fallback prevents wedging on None.
+        state.handle_event(Event::CwdChanged(
+            PaneId::Terminal(8),
+            PathBuf::from("/repo-b"),
+            Vec::new(),
+        ));
+        state.state.panes.panes.get_mut(&0).unwrap()[0].is_focused = false;
+        state.state.panes.panes.get_mut(&0).unwrap()[1].is_focused = true;
+
+        assert!(state.update_focused_pane_with(|_| Err("GetPaneCwd timeout".to_owned())));
+        assert_eq!(state.state.focused_pane_id, Some(PaneId::Terminal(8)));
+        assert_eq!(state.state.focused_pane_cwd, Some(PathBuf::from("/repo-b")));
+
+        // Closing pane 7 prunes its cached CWD entry while retaining live pane 8.
+        state.state.panes.panes.get_mut(&0).unwrap().remove(0);
+        state.prune_closed_pane_cwds(&state.state.panes.clone());
+        assert!(!state.pane_cwds.contains_key(&PaneId::Terminal(7)));
+        assert_eq!(
+            state.pane_cwds.get(&PaneId::Terminal(8)),
+            Some(&PathBuf::from("/repo-b"))
+        );
+    }
+
+    #[test]
+    fn tab_update_resolves_focused_pane_from_cached_cwd() {
+        let mut state = State {
+            focus_cwd_commands: vec!["command_branch".to_owned()],
+            ..State::default()
+        };
+        state.state.panes.panes.insert(
+            0,
+            vec![PaneInfo {
+                id: 3,
+                is_plugin: false,
+                is_focused: true,
+                ..PaneInfo::default()
+            }],
+        );
+        state
+            .pane_cwds
+            .insert(PaneId::Terminal(3), PathBuf::from("/workspace"));
+
+        assert!(state.handle_event(Event::TabUpdate(vec![TabInfo {
+            position: 0,
+            active: true,
+            ..TabInfo::default()
+        }])));
+        assert_eq!(state.state.focused_pane_id, Some(PaneId::Terminal(3)));
+        assert_eq!(
+            state.state.focused_pane_cwd,
+            Some(PathBuf::from("/workspace"))
         );
     }
 }
